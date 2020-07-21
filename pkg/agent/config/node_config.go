@@ -45,14 +45,14 @@ const (
 type GatewayConfig struct {
 	// Name is the name of host gateway, e.g. antrea-gw0.
 	Name string
-	IP   net.IP
+	IPs  []net.IP
 	MAC  net.HardwareAddr
 	// LinkIndex is the link index of host gateway.
 	LinkIndex int
 }
 
 func (g *GatewayConfig) String() string {
-	return fmt.Sprintf("Name %s: IP %s, MAC %s", g.Name, g.IP, g.MAC)
+	return fmt.Sprintf("Name %s: IP %s, MAC %s", g.Name, g.IPs, g.MAC)
 }
 
 type AdapterNetConfig struct {
@@ -75,7 +75,7 @@ type NodeConfig struct {
 	DefaultTunName string
 	// The CIDR block to allocate Pod IPs out of.
 	// It's nil for the networkPolicyOnly trafficEncapMode which doesn't do IPAM.
-	PodCIDR *net.IPNet
+	PodCIDRs []*net.IPNet
 	// The Node's IP used in Kubernetes. It has the network mask information.
 	NodeIPAddr *net.IPNet
 	// Set either via defaultMTU config in antrea.yaml or auto discovered.
@@ -89,8 +89,8 @@ type NodeConfig struct {
 }
 
 func (n *NodeConfig) String() string {
-	return fmt.Sprintf("NodeName: %s, OVSBridge: %s, PodCIDR: %s, NodeIP: %s, Gateway: %s",
-		n.Name, n.OVSBridge, n.PodCIDR, n.NodeIPAddr, n.GatewayConfig)
+	return fmt.Sprintf("NodeName: %s, OVSBridge: %s, PodCIDRs: %v, NodeIP: %s, Gateway: %s",
+		n.Name, n.OVSBridge, n.PodCIDRs, n.NodeIPAddr, n.GatewayConfig)
 }
 
 // User provided network configuration parameters.

@@ -17,6 +17,7 @@
 package agent
 
 import (
+	"fmt"
 	"net"
 	"strings"
 
@@ -32,7 +33,10 @@ import (
 // setupExternalConnectivity installs OpenFlow entries to SNAT Pod traffic using Node IP, and then Pod could communicate
 // to the external IP address.
 func (i *Initializer) setupExternalConnectivity() error {
-	subnetCIDR := i.nodeConfig.PodCIDR
+	subnetCIDR := i.getPodCIDRIPv4()
+	if subnetCIDR == nil {
+		return fmt.Errorf("Failed to find valid IPv4 PodCIDR")
+	}
 	nodeIP := i.nodeConfig.NodeIPAddr.IP
 	// Install OpenFlow entries on the OVS to enable Pod traffic to communicate to external IP addresses.
 	if err := i.ofClient.InstallExternalFlows(nodeIP, *subnetCIDR); err != nil {
@@ -74,7 +78,11 @@ func (i *Initializer) prepareHostNetwork() error {
 	}
 	i.nodeConfig.UplinkNetConfig.DNSServers = dnsServers
 	// Create HNS network.
-	return util.PrepareHNSNetwork(i.nodeConfig.PodCIDR, i.nodeConfig.NodeIPAddr, adapter)
+	subnetCIDR := i.getPodCIDRIPv4()
+	if subnetCIDR == nil {
+		return fmt.Errorf("Failed to find valid IPv4 PodCIDR")
+	}
+	return util.PrepareHNSNetwork(subnetCIDR, i.nodeConfig.NodeIPAddr, adapter)
 }
 
 // prepareOVSBridge adds local port and uplink to ovs bridge.
@@ -186,4 +194,13 @@ func (i *Initializer) initHostNetworkFlows() error {
 // getTunnelLocalIP returns local_ip of tunnel port
 func (i *Initializer) getTunnelPortLocalIP() net.IP {
 	return i.nodeConfig.NodeIPAddr.IP
+}
+
+func (i *Initializer) getPodCIDRIPv4() *net.IPNet {
+	for _, podCIDR := range i.nodeConfig.PodCIDRs {
+		if podCIDR.IP.To4() != nil {
+			return podCIDR
+		}
+	}
+	return nil
 }

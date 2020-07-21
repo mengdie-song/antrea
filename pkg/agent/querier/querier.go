@@ -193,8 +193,10 @@ func (aq agentQuerier) GetAgentInfo(agentInfo *v1beta1.AntreaAgentInfo, partial 
 		agentInfo.Version = querier.GetVersion()
 		agentInfo.PodRef = querier.GetSelfPod()
 		agentInfo.NodeRef = querier.GetSelfNode(true, aq.nodeConfig.Name)
-		if aq.nodeConfig.PodCIDR != nil {
-			agentInfo.NodeSubnet = []string{aq.nodeConfig.PodCIDR.String()}
+		if aq.nodeConfig.PodCIDRs != nil {
+			for _, podCIDR := range aq.nodeConfig.PodCIDRs {
+				agentInfo.NodeSubnet = append(agentInfo.NodeSubnet, podCIDR.String())
+			}
 		}
 		agentInfo.OVSInfo.BridgeName = aq.nodeConfig.OVSBridge
 		agentInfo.APIPort = aq.apiPort

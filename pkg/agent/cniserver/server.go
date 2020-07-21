@@ -218,9 +218,15 @@ func (s *CNIServer) checkRequestMessage(request *cnipb.CniCmdRequest) (*CNIConfi
 }
 
 func (s *CNIServer) updateLocalIPAMSubnet(cniConfig *CNIConfig) {
-	cniConfig.NetworkConfig.IPAM.Gateway = s.nodeConfig.GatewayConfig.IP.String()
-	cniConfig.NetworkConfig.IPAM.Subnet = s.nodeConfig.PodCIDR.String()
-	cniConfig.NetworkConfiguration, _ = json.Marshal(cniConfig.NetworkConfig)
+	gwIPv4 := util.GetIPv4Addr(s.nodeConfig.GatewayConfig.IPs)
+	cniConfig.NetworkConfig.IPAM.Gateway = gwIPv4.String()
+	for _, subnet := range s.nodeConfig.PodCIDRs {
+		if subnet.IP.To4() != nil {
+			cniConfig.NetworkConfig.IPAM.Subnet = subnet.String()
+			cniConfig.NetworkConfiguration, _ = json.Marshal(cniConfig.NetworkConfig)
+			break
+		}
+	}
 }
 
 func (s *CNIServer) generateCNIErrorResponse(cniErrorCode cnipb.ErrorCode, cniErrorMsg string) *cnipb.CniCmdResponse {
@@ -399,7 +405,8 @@ func (s *CNIServer) CmdAdd(ctx context.Context, request *cnipb.CniCmdRequest) (*
 	result.IPs = ipamResult.IPs
 	result.Routes = ipamResult.Routes
 	// Ensure interface gateway setting and mapping relations between result.Interfaces and result.IPs
-	updateResultIfaceConfig(result, s.nodeConfig.GatewayConfig.IP)
+	gwIPv4 := util.GetIPv4Addr(s.nodeConfig.GatewayConfig.IPs)
+	updateResultIfaceConfig(result, gwIPv4)
 	// Setup pod interfaces and connect to ovs bridge
 	podName := string(cniConfig.K8S_POD_NAME)
 	podNamespace := string(cniConfig.K8S_POD_NAMESPACE)
