@@ -150,12 +150,11 @@ func (c *Controller) removeStaleGatewayRoutes() error {
 	// running, so the route to local Pods will be desired as well.
 	var desiredPodCIDRs []string
 	for _, node := range nodes {
-		// PodCIDR is allocated by K8s NodeIpamController asynchronously so it's possible we see a Node
-		// with no PodCIDR set when it just joins the cluster.
-		if node.Spec.PodCIDR == "" {
+		podCIDRs := getPodCIDRsOnNode(node)
+		if len(podCIDRs) == 0 {
 			continue
 		}
-		desiredPodCIDRs = append(desiredPodCIDRs, node.Spec.PodCIDR)
+		desiredPodCIDRs = append(desiredPodCIDRs, podCIDRs...)
 	}
 
 	// routeClient will remove orphaned routes whose destinations are not in desiredPodCIDRs.
@@ -353,16 +352,17 @@ func (c *Controller) syncNodeRoute(nodeName string) error {
 func (c *Controller) deleteNodeRoute(nodeName string) error {
 	klog.Infof("Deleting routes and flows to Node %s", nodeName)
 
-	podCIDR, installed := c.installedNodes.Load(nodeName)
+	podCIDRs, installed := c.installedNodes.Load(nodeName)
 	if !installed {
 		// Route is not added for this Node.
 		return nil
 	}
 
-	if err := c.routeClient.DeleteRoutes(podCIDR.(*net.IPNet)); err != nil {
-		return fmt.Errorf("failed to delete the route to Node %s: %v", nodeName, err)
+	for _, podCIDR := range podCIDRs.([]*net.IPNet) {
+		if err := c.routeClient.DeleteRoutes(podCIDR); err != nil {
+			return fmt.Errorf("failed to delete the route to Node %s: %v", nodeName, err)
+		}
 	}
-
 	if err := c.ofClient.UninstallNodeFlows(nodeName); err != nil {
 		return fmt.Errorf("failed to uninstall flows to Node %s: %v", nodeName, err)
 	}
@@ -390,25 +390,14 @@ func (c *Controller) addNodeRoute(nodeName string, node *v1.Node) error {
 		return nil
 	}
 
-	klog.Infof("Adding routes and flows to Node %s, podCIDR: %s, addresses: %v",
-		nodeName, node.Spec.PodCIDR, node.Status.Addresses)
+	klog.Infof("Adding routes and flows to Node %s, podCIDRs: %v, addresses: %v",
+		nodeName, node.Spec.PodCIDRs, node.Status.Addresses)
 
-	if node.Spec.PodCIDR == "" {
-		klog.Errorf("PodCIDR is empty for Node %s", nodeName)
-		// Does not help to return an error and trigger controller retries.
-		return nil
-	}
-	peerPodCIDRAddr, peerPodCIDR, err := net.ParseCIDR(node.Spec.PodCIDR)
-	if err != nil {
-		klog.Errorf("Failed to parse PodCIDR %s for Node %s", node.Spec.PodCIDR, nodeName)
-		return nil
-	}
 	peerNodeIP, err := GetNodeAddr(node)
 	if err != nil {
 		klog.Errorf("Failed to retrieve IP address of Node %s: %v", nodeName, err)
 		return nil
 	}
-	peerGatewayIP := ip.NextIP(peerPodCIDRAddr)
 
 	ipsecTunOFPort := int32(0)
 	if c.networkConfig.EnableIPSecTunnel {
@@ -420,11 +409,27 @@ func (c *Controller) addNodeRoute(nodeName string, node *v1.Node) error {
 		}
 	}
 
+	podCIDRStrs := getPodCIDRsOnNode(node)
+	if len(podCIDRStrs) == 0 {
+		// If no valid PodCIDR is configured in Node.Spec, return immediately.
+		return nil
+	}
+	var podCIDRs []*net.IPNet
+	peerConfig := make(map[*net.IPNet]net.IP, len(podCIDRStrs))
+	for _, podCIDR := range podCIDRStrs {
+		peerPodCIDRAddr, peerPodCIDR, err := net.ParseCIDR(podCIDR)
+		if err != nil {
+			klog.Errorf("Failed to parse PodCIDR %s for Node %s", podCIDR, nodeName)
+			return nil
+		}
+		peerGatewayIP := ip.NextIP(peerPodCIDRAddr)
+		peerConfig[peerPodCIDR] = peerGatewayIP
+		podCIDRs = append(podCIDRs, peerPodCIDR)
+	}
 	err = c.ofClient.InstallNodeFlows(
 		nodeName,
 		c.nodeConfig.GatewayConfig.MAC,
-		*peerPodCIDR,
-		peerGatewayIP,
+		peerConfig,
 		peerNodeIP,
 		config.DefaultTunOFPort,
 		uint32(ipsecTunOFPort))
@@ -432,11 +437,26 @@ func (c *Controller) addNodeRoute(nodeName string, node *v1.Node) error {
 		return fmt.Errorf("failed to install flows to Node %s: %v", nodeName, err)
 	}
 
-	if err := c.routeClient.AddRoutes(peerPodCIDR, peerNodeIP, peerGatewayIP); err != nil {
-		return err
+	for peerPodCIDR, peerGatewayIP := range peerConfig {
+		if err := c.routeClient.AddRoutes(peerPodCIDR, peerNodeIP, peerGatewayIP); err != nil {
+			return err
+		}
 	}
-	c.installedNodes.Store(nodeName, peerPodCIDR)
+	c.installedNodes.Store(nodeName, podCIDRs)
 	return err
+}
+
+func getPodCIDRsOnNode(node *v1.Node) []string {
+	if node.Spec.PodCIDRs != nil {
+		return node.Spec.PodCIDRs
+	}
+
+	if node.Spec.PodCIDR == "" {
+		klog.Errorf("PodCIDR is empty for Node %s", node.Name)
+		// Does not help to return an error and trigger controller retries.
+		return nil
+	}
+	return []string{node.Spec.PodCIDR}
 }
 
 // createIPSecTunnelPort creates an IPSec tunnel port for the remote Node if the

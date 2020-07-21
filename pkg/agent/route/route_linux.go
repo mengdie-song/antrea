@@ -17,6 +17,7 @@ package route
 import (
 	"bytes"
 	"fmt"
+	"github.com/containernetworking/plugins/pkg/ip"
 	"net"
 	"os"
 	"os/exec"
@@ -53,8 +54,10 @@ const (
 	svcTblVirtualDefaultGWMAC = "12:34:56:78:9a:bc"
 
 	// Antrea managed ipset.
-	// antreaPodIPSet contains all Pod CIDRs of this cluster.
+	// antreaPodIPSet contains all IPv4 Pod CIDRs of this cluster.
 	antreaPodIPSet = "ANTREA-POD-IP"
+	// antreaPodIP6Set contains all IPv6 Pod CIDRs of this cluster.
+	antreaPodIP6Set = "ANTREA-POD-IP6"
 
 	// Antrea managed iptables chains.
 	antreaForwardChain     = "ANTREA-FORWARD"
@@ -67,6 +70,9 @@ var (
 	// RtTblSelectorValue selects which route table to use to forward service traffic back to host gateway antrea-gw0.
 	RtTblSelectorValue = 1 << 11
 	rtTblSelectorMark  = fmt.Sprintf("%#x/%#x", RtTblSelectorValue, RtTblSelectorValue)
+	// globalVMAC is used in the IPv6 neighbor configuration to advertise ND solicitation for the IPv6 address of the
+	// host gateway interface on other Nodes.
+	globalVMAC, _ = net.ParseMAC("aa:bb:cc:dd:ee:ff")
 )
 
 // Client implements Interface.
@@ -82,6 +88,8 @@ type Client struct {
 	serviceRtTable *serviceRtTableConfig
 	// nodeRoutes caches ip routes to remote Pods. It's a map of podCIDR to routes.
 	nodeRoutes sync.Map
+	// nodeNeighbors caches IPv6 Neighbors to remote hote gateway
+	nodeNeighbors sync.Map
 }
 
 type serviceRtTableConfig struct {
@@ -161,14 +169,30 @@ func (c *Client) initIPSet() error {
 	if c.encapMode.IsNetworkPolicyOnly() {
 		return nil
 	}
-	if err := ipset.CreateIPSet(antreaPodIPSet, ipset.HashNet); err != nil {
+	if err := ipset.CreateIPSet(antreaPodIPSet, ipset.HashNet, false); err != nil {
 		return err
 	}
-	// Ensure its own PodCIDR is in it.
-	if err := ipset.AddEntry(antreaPodIPSet, c.nodeConfig.PodIPv4CIDR.String()); err != nil {
+	if err := ipset.CreateIPSet(antreaPodIP6Set, ipset.HashNet, true); err != nil {
 		return err
+	}
+
+	// Loop all valid PodCIDR and add into the corresponding ipset.
+	for _, podCIDR := range []*net.IPNet{c.nodeConfig.PodIPv4CIDR, c.nodeConfig.PodIPv6CIDR} {
+		if podCIDR != nil {
+			ipsetName := getIPsetName(podCIDR.IP)
+			if err := ipset.AddEntry(ipsetName, podCIDR.String()); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func getIPsetName(ip net.IP) string {
+	if ip.To4() == nil {
+		return antreaPodIP6Set
+	}
+	return antreaPodIPSet
 }
 
 // writeEKSMangleRule writes an additional iptables mangle rule to the
@@ -197,6 +221,9 @@ func (c *Client) writeEKSMangleRule(iptablesData *bytes.Buffer) {
 // initIPTables ensure that the iptables infrastructure we use is set up.
 // It's idempotent and can safely be called on every startup.
 func (c *Client) initIPTables() error {
+	if c.nodeConfig.PodIPv6CIDR != nil {
+		c.ipt.SetIPv6Supported(true)
+	}
 	// Create the antrea managed chains and link them to built-in chains.
 	// We cannot use iptables-restore for these jump rules because there
 	// are non antrea managed rules in built-in chains.
@@ -216,81 +243,29 @@ func (c *Client) initIPTables() error {
 		}
 	}
 
-	// Create required rules in the antrea chains.
-	// Use iptables-restore as it flushes the involved chains and creates the desired rules
-	// with a single call, instead of string matching to clean up stale rules.
-	iptablesData := bytes.NewBuffer(nil)
-	// Write head lines anyway so the undesired rules can be deleted when noEncap -> encap.
-	writeLine(iptablesData, "*mangle")
-	writeLine(iptablesData, iptables.MakeChainLine(antreaMangleChain))
-	hostGateway := c.nodeConfig.GatewayConfig.Name
-	if c.encapMode.SupportsNoEncap() {
-		writeLine(iptablesData, []string{
-			"-A", antreaMangleChain,
-			"-m", "comment", "--comment", `"Antrea: mark pod to service packets"`,
-			"-i", hostGateway, "-d", c.serviceCIDR.String(),
-			"-j", iptables.MarkTarget, "--set-xmark", rtTblSelectorMark,
-		}...)
-		writeLine(iptablesData, []string{
-			"-A", antreaMangleChain,
-			"-m", "comment", "--comment", `"Antrea: unmark post LB service packets"`,
-			"-i", hostGateway, "!", "-d", c.serviceCIDR.String(),
-			"-j", iptables.MarkTarget, "--set-xmark", "0/0xffffffff",
-		}...)
-		// When Antrea is used to enforce NetworkPolicies in EKS, an additional iptables
-		// mangle rule is required. See https://github.com/vmware-tanzu/antrea/issues/678.
-		if env.IsCloudEKS() {
-			c.writeEKSMangleRule(iptablesData)
-		}
-	}
-	writeLine(iptablesData, "COMMIT")
-
-	writeLine(iptablesData, "*filter")
-	writeLine(iptablesData, iptables.MakeChainLine(antreaForwardChain))
-	writeLine(iptablesData, []string{
-		"-A", antreaForwardChain,
-		"-m", "comment", "--comment", `"Antrea: accept packets from local pods"`,
-		"-i", hostGateway,
-		"-j", iptables.AcceptTarget,
-	}...)
-	writeLine(iptablesData, []string{
-		"-A", antreaForwardChain,
-		"-m", "comment", "--comment", `"Antrea: accept packets to local pods"`,
-		"-o", hostGateway,
-		"-j", iptables.AcceptTarget,
-	}...)
-	writeLine(iptablesData, "COMMIT")
-
-	// In policy-only mode, masquerade is managed by primary CNI.
-	// Antrea should not get involved.
-	writeLine(iptablesData, "*nat")
-	writeLine(iptablesData, iptables.MakeChainLine(antreaPostRoutingChain))
-	if !c.encapMode.IsNetworkPolicyOnly() {
-		writeLine(iptablesData, []string{
-			"-A", antreaPostRoutingChain,
-			"-m", "comment", "--comment", `"Antrea: masquerade pod to external packets"`,
-			"-s", c.nodeConfig.PodIPv4CIDR.String(), "-m", "set", "!", "--match-set", antreaPodIPSet, "dst",
-			"-j", iptables.MasqueradeTarget,
-		}...)
-	}
-	writeLine(iptablesData, "COMMIT")
-
-	writeLine(iptablesData, "*raw")
-	writeLine(iptablesData, iptables.MakeChainLine(antreaRawChain))
-	if c.encapMode.SupportsNoEncap() {
-		writeLine(iptablesData, []string{
-			"-A", antreaRawChain,
-			"-m", "comment", "--comment", `"Antrea: reentry pod traffic skip conntrack"`,
-			"-i", hostGateway, "-m", "mac", "--mac-source", openflow.ReentranceMAC.String(),
-			"-j", iptables.ConnTrackTarget, "--notrack",
-		}...)
-	}
-	writeLine(iptablesData, "COMMIT")
-
-	// Setting --noflush to keep the previous contents (i.e. non antrea managed chains) of the tables.
-	if err := c.ipt.Restore(iptablesData.Bytes(), false); err != nil {
+	serviceCIDRv4, serviceCIDRv6, err := splitCIDRsByAF([]*net.IPNet{c.serviceCIDR})
+	if err != nil {
 		return err
 	}
+
+	// Use iptables-restore to configure IPv4 settings.
+	if serviceCIDRv4 != nil || c.nodeConfig.PodIPv4CIDR != nil {
+		iptablesData := c.restoreIptablesData(serviceCIDRv4, c.nodeConfig.PodIPv4CIDR, antreaPodIPSet)
+		// Setting --noflush to keep the previous contents (i.e. non antrea managed chains) of the tables.
+		if err := c.ipt.Restore(iptablesData.Bytes(), false, false); err != nil {
+			return err
+		}
+	}
+
+	// Use ip6tables-restore to configure IPv6 settings.
+	if serviceCIDRv6 != nil || c.nodeConfig.PodIPv6CIDR != nil {
+		iptablesData := c.restoreIptablesData(serviceCIDRv6, c.nodeConfig.PodIPv6CIDR, antreaPodIP6Set)
+		// Setting --noflush to keep the previous contents (i.e. non antrea managed chains) of the tables.
+		if err := c.ipt.Restore(iptablesData.Bytes(), false, true); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -318,18 +293,21 @@ func (c *Client) Reconcile(podCIDRs []string) error {
 	desiredPodCIDRs := sets.NewString(podCIDRs...)
 
 	// Remove orphaned podCIDRs from antreaPodIPSet.
-	entries, err := ipset.ListEntries(antreaPodIPSet)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if desiredPodCIDRs.Has(entry) {
-			continue
-		}
-		klog.V(4).Infof("Deleting orphaned ip %s from ipset", entry)
-		if err := ipset.DelEntry(antreaPodIPSet, entry); err != nil {
+	for _, ipsetName := range []string{antreaPodIPSet, antreaPodIP6Set} {
+		entries, err := ipset.ListEntries(ipsetName)
+		if err != nil {
 			return err
 		}
+		for _, entry := range entries {
+			if desiredPodCIDRs.Has(entry) {
+				continue
+			}
+			klog.V(4).Infof("Deleting orphaned ip %s from ipset", entry)
+			if err := ipset.DelEntry(ipsetName, entry); err != nil {
+				return err
+			}
+		}
+
 	}
 
 	// Remove orphaned routes from host network.
@@ -348,31 +326,71 @@ func (c *Client) Reconcile(podCIDRs []string) error {
 			}
 		}
 	}
+
+	desiredGWs := getIPv6Gateways(podCIDRs)
+	// Return immediately if there is no IPv6 gateway address configured on the Nodes.
+	if desiredGWs.Len() == 0 {
+		return nil
+	}
+	// Remove orphaned IPv6 Neighbors from host network.
+	actualNeighbors, err := c.listIPv6NeighborsOnGateway()
+	if err != nil {
+		return err
+	}
+	for neighIP, actualNeigh := range actualNeighbors {
+		if desiredGWs.Has(neighIP) {
+			continue
+		}
+		klog.V(4).Infof("Deleting orphaned IPv6 neighbor %v", actualNeighbors)
+		if err := netlink.NeighDel(actualNeigh); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // AddRoutes adds routes to a new podCIDR. It overrides the routes if they already exist.
 func (c *Client) AddRoutes(podCIDR *net.IPNet, nodeIP, nodeGwIP net.IP) error {
 	podCIDRStr := podCIDR.String()
-	// Add this podCIDR to antreaPodIPSet so that packets to them won't be masqueraded when they leave the host.
-	if err := ipset.AddEntry(antreaPodIPSet, podCIDRStr); err != nil {
+	// Add this podCIDR to antreaPodIPSet/antreaPodIP6Set so that packets to them won't be masqueraded when they leave the host.
+	ipsetName := getIPsetName(podCIDR.IP)
+	if err := ipset.AddEntry(ipsetName, podCIDRStr); err != nil {
 		return err
 	}
 
 	// Install routes to this Node.
-	routes := []*netlink.Route{
-		{
-			Dst:       podCIDR,
-			Flags:     int(netlink.FLAG_ONLINK),
-			LinkIndex: c.nodeConfig.GatewayConfig.LinkIndex,
-			Gw:        nodeGwIP,
-			Table:     c.serviceRtTable.Idx,
-		},
+	var routes []*netlink.Route
+	if podCIDR.IP.To4() != nil {
+		routes = []*netlink.Route{
+			{
+				Dst:       podCIDR,
+				Flags:     int(netlink.FLAG_ONLINK),
+				LinkIndex: c.nodeConfig.GatewayConfig.LinkIndex,
+				Gw:        nodeGwIP,
+				Table:     c.serviceRtTable.Idx,
+			},
+		}
+	} else {
+		// "on-link" is not identified in IPv6 route entries, so split the configuration into 2 entries.
+		routes = []*netlink.Route{
+			{
+				Dst:       &net.IPNet{IP: nodeGwIP, Mask: net.IPMask{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
+				LinkIndex: c.nodeConfig.GatewayConfig.LinkIndex,
+				Table:     c.serviceRtTable.Idx,
+			},
+			{
+				Dst:       podCIDR,
+				LinkIndex: c.nodeConfig.GatewayConfig.LinkIndex,
+				Gw:        nodeGwIP,
+				Table:     c.serviceRtTable.Idx,
+			},
+		}
 	}
 
 	// If service route table and main route table is not the same , add
 	// peer CIDR to main route table too (i.e in NoEncap and hybrid mode)
 	if !c.serviceRtTable.IsMainTable() {
+		// TODO: needs enhancement when supporting NoEncap mode in IPv6.
 		if c.encapMode.NeedsEncapToPeer(nodeIP, c.nodeConfig.NodeIPAddr) {
 			// need overlay tunnel
 			routes = append(routes, &netlink.Route{
@@ -403,6 +421,21 @@ func (c *Client) AddRoutes(podCIDR *net.IPNet, nodeIP, nodeGwIP net.IP) error {
 			return fmt.Errorf("failed to install route to peer %s with netlink: %v", nodeIP, err)
 		}
 	}
+
+	if podCIDR.IP.To4() == nil {
+		neigh := &netlink.Neigh{
+			LinkIndex:    c.nodeConfig.GatewayConfig.LinkIndex,
+			Family:       netlink.FAMILY_V6,
+			State:        netlink.NUD_PERMANENT,
+			IP:           nodeGwIP,
+			HardwareAddr: globalVMAC,
+		}
+		if err := netlink.NeighSet(neigh); err != nil {
+			return fmt.Errorf("failed to add neigh %v to gw %s: %v", neigh, c.nodeConfig.GatewayConfig.Name, err)
+		}
+		c.nodeNeighbors.Store(podCIDR, neigh)
+	}
+
 	c.nodeRoutes.Store(podCIDRStr, routes)
 	return nil
 }
@@ -411,21 +444,32 @@ func (c *Client) AddRoutes(podCIDR *net.IPNet, nodeIP, nodeGwIP net.IP) error {
 func (c *Client) DeleteRoutes(podCIDR *net.IPNet) error {
 	podCIDRStr := podCIDR.String()
 	// Delete this podCIDR from antreaPodIPSet as the CIDR is no longer for Pods.
-	if err := ipset.DelEntry(antreaPodIPSet, podCIDRStr); err != nil {
+	ipsetName := getIPsetName(podCIDR.IP)
+	if err := ipset.DelEntry(ipsetName, podCIDRStr); err != nil {
 		return err
 	}
 
 	routes, exists := c.nodeRoutes.Load(podCIDRStr)
-	if !exists {
-		return nil
+	if exists {
+		for _, r := range routes.([]*netlink.Route) {
+			klog.V(4).Infof("Deleting route %v", r)
+			if err := netlink.RouteDel(r); err != nil && err != unix.ESRCH {
+				return err
+			}
+		}
+		c.nodeRoutes.Delete(podCIDRStr)
 	}
-	for _, r := range routes.([]*netlink.Route) {
-		klog.V(4).Infof("Deleting route %v", r)
-		if err := netlink.RouteDel(r); err != nil && err != unix.ESRCH {
-			return err
+
+	// Remove the Neighbor configurations if the PodCIDR is IPv6 address.
+	if podCIDR.IP.To4() == nil {
+		neigh, exists := c.nodeNeighbors.Load(podCIDR)
+		if exists {
+			if err := netlink.NeighDel(neigh.(*netlink.Neigh)); err != nil {
+				return err
+			}
+			c.nodeNeighbors.Delete(podCIDRStr)
 		}
 	}
-	c.nodeRoutes.Delete(podCIDRStr)
 	return nil
 }
 
@@ -435,7 +479,7 @@ func (c *Client) listIPRoutes() (map[string][]*netlink.Route, error) {
 	filter := &netlink.Route{
 		Table:     c.serviceRtTable.Idx,
 		LinkIndex: c.nodeConfig.GatewayConfig.LinkIndex}
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF)
+	routes, err := getRoutesListFiltered(filter, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +495,7 @@ func (c *Client) listIPRoutes() (map[string][]*netlink.Route, error) {
 	if !c.serviceRtTable.IsMainTable() {
 		// get all routes on antrea-gw0 from main table.
 		filter.Table = 0
-		routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_OIF)
+		routes, err := getRoutesListFiltered(filter, netlink.RT_FILTER_OIF)
 		if err != nil {
 			return nil, err
 		}
@@ -463,7 +507,7 @@ func (c *Client) listIPRoutes() (map[string][]*netlink.Route, error) {
 		}
 
 		// now get all routes antrea-gw0 on other interfaces from main table.
-		routes, err = netlink.RouteListFiltered(netlink.FAMILY_V4, nil, 0)
+		routes, err = getRoutesListFiltered(nil, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -732,4 +776,138 @@ func (c *Client) UnMigrateRoutesFromGw(route *net.IPNet, linkName string) error 
 		}
 	}
 	return nil
+}
+
+func (c *Client) listIPv6NeighborsOnGateway() (map[string]*netlink.Neigh, error) {
+	neighs, err := netlink.NeighList(c.nodeConfig.GatewayConfig.LinkIndex, netlink.FAMILY_V6)
+	if err != nil {
+		return nil, err
+	}
+	var neighMap map[string]*netlink.Neigh
+	for _, neigh := range neighs {
+		if neigh.IP == nil {
+			continue
+		}
+		neighMap[neigh.IP.String()] = &neigh
+	}
+	return neighMap, nil
+}
+
+func (c *Client) restoreIptablesData(serviceCIDR, podCIDR *net.IPNet, podIPSet string) *bytes.Buffer {
+	// Create required rules in the antrea chains.
+	// Use iptables-restore as it flushes the involved chains and creates the desired rules
+	// with a single call, instead of string matching to clean up stale rules.
+	iptablesData := bytes.NewBuffer(nil)
+	// Write head lines anyway so the undesired rules can be deleted when noEncap -> encap.
+	writeLine(iptablesData, "*mangle")
+	writeLine(iptablesData, iptables.MakeChainLine(antreaMangleChain))
+	hostGateway := c.nodeConfig.GatewayConfig.Name
+	if c.encapMode.SupportsNoEncap() {
+		writeLine(iptablesData, []string{
+			"-A", antreaMangleChain,
+			"-m", "comment", "--comment", `"Antrea: mark pod to service packets"`,
+			"-i", hostGateway, "-d", serviceCIDR.String(),
+			"-j", iptables.MarkTarget, "--set-xmark", rtTblSelectorMark,
+		}...)
+		writeLine(iptablesData, []string{
+			"-A", antreaMangleChain,
+			"-m", "comment", "--comment", `"Antrea: unmark post LB service packets"`,
+			"-i", hostGateway, "!", "-d", serviceCIDR.String(),
+			"-j", iptables.MarkTarget, "--set-xmark", "0/0xffffffff",
+		}...)
+		// When Antrea is used to enforce NetworkPolicies in EKS, an additional iptables
+		// mangle rule is required. See https://github.com/vmware-tanzu/antrea/issues/678.
+		if env.IsCloudEKS() {
+			c.writeEKSMangleRule(iptablesData)
+		}
+	}
+	writeLine(iptablesData, "COMMIT")
+
+	writeLine(iptablesData, "*filter")
+	writeLine(iptablesData, iptables.MakeChainLine(antreaForwardChain))
+	writeLine(iptablesData, []string{
+		"-A", antreaForwardChain,
+		"-m", "comment", "--comment", `"Antrea: accept packets from local pods"`,
+		"-i", hostGateway,
+		"-j", iptables.AcceptTarget,
+	}...)
+	writeLine(iptablesData, []string{
+		"-A", antreaForwardChain,
+		"-m", "comment", "--comment", `"Antrea: accept packets to local pods"`,
+		"-o", hostGateway,
+		"-j", iptables.AcceptTarget,
+	}...)
+	writeLine(iptablesData, "COMMIT")
+
+	// In policy-only mode, masquerade is managed by primary CNI.
+	// Antrea should not get involved.
+	writeLine(iptablesData, "*nat")
+	writeLine(iptablesData, iptables.MakeChainLine(antreaPostRoutingChain))
+	if !c.encapMode.IsNetworkPolicyOnly() {
+		writeLine(iptablesData, []string{
+			"-A", antreaPostRoutingChain,
+			"-m", "comment", "--comment", `"Antrea: masquerade pod to external packets"`,
+			"-s", podCIDR.String(), "-m", "set", "!", "--match-set", podIPSet, "dst",
+			"-j", iptables.MasqueradeTarget,
+		}...)
+	}
+	writeLine(iptablesData, "COMMIT")
+
+	writeLine(iptablesData, "*raw")
+	writeLine(iptablesData, iptables.MakeChainLine(antreaRawChain))
+	if c.encapMode.SupportsNoEncap() {
+		writeLine(iptablesData, []string{
+			"-A", antreaRawChain,
+			"-m", "comment", "--comment", `"Antrea: reentry pod traffic skip conntrack"`,
+			"-i", hostGateway, "-m", "mac", "--mac-source", openflow.ReentranceMAC.String(),
+			"-j", iptables.ConnTrackTarget, "--notrack",
+		}...)
+	}
+	writeLine(iptablesData, "COMMIT")
+	return iptablesData
+}
+
+func getRoutesListFiltered(filter *netlink.Route, filterMask uint64) ([]netlink.Route, error) {
+	var routes []netlink.Route
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, filterMask)
+	if err != nil {
+		return nil, err
+	}
+	routesV6, err := netlink.RouteListFiltered(netlink.FAMILY_V6, filter, filterMask)
+	if err != nil {
+		return routes, err
+	}
+	routes = append(routes, routesV6...)
+	return routes, nil
+}
+
+func getIPv6Gateways(podCIDRs []string) sets.String {
+	var ipv6GWs []string
+	for _, podCIDR := range podCIDRs {
+		peerPodCIDRAddr, _, _ := net.ParseCIDR(podCIDR)
+		if peerPodCIDRAddr.To4() != nil {
+			continue
+		}
+		peerGatewayIP := ip.NextIP(peerPodCIDRAddr)
+		ipv6GWs = append(ipv6GWs, peerGatewayIP.String())
+	}
+	return sets.NewString(ipv6GWs...)
+}
+
+func splitCIDRsByAF(cidrs []*net.IPNet) (*net.IPNet, *net.IPNet, error) {
+	var cidr4, cidr6 *net.IPNet
+	for _, cidr := range cidrs {
+		if cidr.IP.To4() != nil {
+			if cidr4 != nil {
+				return nil, nil, fmt.Errorf("one IPv4 Service CIDR at most is allowed")
+			}
+			cidr4 = cidr
+		} else {
+			if cidr6 != nil {
+				return nil, nil, fmt.Errorf("one IPv6 Service CIDR at most is allowed")
+			}
+			cidr6 = cidr
+		}
+	}
+	return cidr4, cidr6, nil
 }

@@ -33,8 +33,11 @@ const (
 var memberPattern = regexp.MustCompile("(?m)^(.*\n)*Members:\n")
 
 // CreateIPSet creates a new set, it will ignore error when the set already exists.
-func CreateIPSet(name string, setType SetType) error {
+func CreateIPSet(name string, setType SetType, isIPv6 bool) error {
 	cmd := exec.Command("ipset", "create", name, string(setType), "-exist")
+	if isIPv6 {
+		cmd = exec.Command("ipset", "create", name, string(setType), "family", "inet6", "-exist")
+	}
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("error creating ipset %s: %v", name, err)
 	}

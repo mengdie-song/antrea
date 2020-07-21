@@ -202,12 +202,12 @@ func (b *ofFlowBuilder) MatchDstIP(ip net.IP) FlowBuilder {
 func (b *ofFlowBuilder) MatchDstIPNet(ipnet net.IPNet) FlowBuilder {
 	b.matchers = append(b.matchers, fmt.Sprintf("nw_dst=%s", ipnet.String()))
 	b.Match.IpDa = &ipnet.IP
-	b.Match.IpDaMask = maskToIPv4(ipnet.Mask)
+	b.Match.IpDaMask = maskToIP(ipnet.Mask)
 	return b
 }
 
-func maskToIPv4(mask net.IPMask) *net.IP {
-	ip := net.IPv4(mask[0], mask[1], mask[2], mask[3])
+func maskToIP(mask net.IPMask) *net.IP {
+	ip := net.IP(mask)
 	return &ip
 }
 
@@ -222,7 +222,7 @@ func (b *ofFlowBuilder) MatchSrcIP(ip net.IP) FlowBuilder {
 func (b *ofFlowBuilder) MatchSrcIPNet(ipnet net.IPNet) FlowBuilder {
 	b.matchers = append(b.matchers, fmt.Sprintf("nw_src=%s", ipnet.String()))
 	b.Match.IpSa = &ipnet.IP
-	b.Match.IpSaMask = maskToIPv4(ipnet.Mask)
+	b.Match.IpSaMask = maskToIP(ipnet.Mask)
 	return b
 }
 
@@ -368,7 +368,7 @@ func (b *ofFlowBuilder) MatchCTSrcIP(ip net.IP) FlowBuilder {
 func (b *ofFlowBuilder) MatchCTSrcIPNet(ipNet net.IPNet) FlowBuilder {
 	b.matchers = append(b.matchers, fmt.Sprintf("nw_dst=%s", ipNet.String()))
 	b.Match.CtIpSa = &ipNet.IP
-	b.Match.CtIpSaMask = maskToIPv4(ipNet.Mask)
+	b.Match.CtIpSaMask = maskToIP(ipNet.Mask)
 	return b
 }
 
@@ -384,7 +384,7 @@ func (b *ofFlowBuilder) MatchCTDstIP(ip net.IP) FlowBuilder {
 // MatchCTDstIPNet is the same as MatchCTDstIP but supports IP masking.
 func (b *ofFlowBuilder) MatchCTDstIPNet(ipNet net.IPNet) FlowBuilder {
 	b.Match.CtIpDa = &ipNet.IP
-	b.Match.CtIpDaMask = maskToIPv4(ipNet.Mask)
+	b.Match.CtIpDaMask = maskToIP(ipNet.Mask)
 	b.matchers = append(b.matchers, fmt.Sprintf("ct_nw_dst=%s", ipNet.String()))
 	return b
 }
