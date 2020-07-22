@@ -123,7 +123,7 @@ func TestAgentQuerierGetAgentInfo(t *testing.T) {
 				Name:       "foo",
 				OVSBridge:  "br-int",
 				NodeIPAddr: getIPNet("10.10.0.10"),
-				PodCIDR:    getIPNet("20.20.20.0/24"),
+				PodCIDRs:   []*net.IPNet{getIPNet("20.20.20.0/24")},
 			},
 			apiPort: 10350,
 			partial: false,

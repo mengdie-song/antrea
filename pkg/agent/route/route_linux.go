@@ -164,9 +164,11 @@ func (c *Client) initIPSet() error {
 	if err := ipset.CreateIPSet(antreaPodIPSet, ipset.HashNet); err != nil {
 		return err
 	}
-	// Ensure its own PodCIDR is in it.
-	if err := ipset.AddEntry(antreaPodIPSet, c.nodeConfig.PodCIDR.String()); err != nil {
-		return err
+	// Ensure its own PodCIDRs is in it.
+	for _, podCIDR := range c.nodeConfig.PodCIDRs {
+		if err := ipset.AddEntry(antreaPodIPSet, podCIDR.String()); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -266,12 +268,14 @@ func (c *Client) initIPTables() error {
 	writeLine(iptablesData, "*nat")
 	writeLine(iptablesData, iptables.MakeChainLine(antreaPostRoutingChain))
 	if !c.encapMode.IsNetworkPolicyOnly() {
-		writeLine(iptablesData, []string{
-			"-A", antreaPostRoutingChain,
-			"-m", "comment", "--comment", `"Antrea: masquerade pod to external packets"`,
-			"-s", c.nodeConfig.PodCIDR.String(), "-m", "set", "!", "--match-set", antreaPodIPSet, "dst",
-			"-j", iptables.MasqueradeTarget,
-		}...)
+		for _, podCIDR := range c.nodeConfig.PodCIDRs {
+			writeLine(iptablesData, []string{
+				"-A", antreaPostRoutingChain,
+				"-m", "comment", "--comment", `"Antrea: masquerade pod to external packets"`,
+				"-s", podCIDR.String(), "-m", "set", "!", "--match-set", antreaPodIPSet, "dst",
+				"-j", iptables.MasqueradeTarget,
+			}...)
+		}
 	}
 	writeLine(iptablesData, "COMMIT")
 
@@ -407,7 +411,7 @@ func (c *Client) AddRoutes(podCIDR *net.IPNet, nodeIP, nodeGwIP net.IP) error {
 	return nil
 }
 
-// DeleteRoutes deletes routes to a PodCIDR. It does nothing if the routes doesn't exist.
+// DeleteRoutes deletes routes to a PodCIDRs. It does nothing if the routes doesn't exist.
 func (c *Client) DeleteRoutes(podCIDR *net.IPNet) error {
 	podCIDRStr := podCIDR.String()
 	// Delete this podCIDR from antreaPodIPSet as the CIDR is no longer for Pods.
@@ -506,14 +510,16 @@ func (c *Client) addServiceRouting() error {
 	gwConfig := c.nodeConfig.GatewayConfig
 	if !c.encapMode.IsNetworkPolicyOnly() {
 		// Add local podCIDR if applicable to service rt table.
-		route := &netlink.Route{
-			LinkIndex: gwConfig.LinkIndex,
-			Scope:     netlink.SCOPE_LINK,
-			Dst:       c.nodeConfig.PodCIDR,
-			Table:     c.serviceRtTable.Idx,
-		}
-		if err := netlink.RouteReplace(route); err != nil {
-			return fmt.Errorf("failed to add link route to service table: %v", err)
+		for _, podCIDR := range c.nodeConfig.PodCIDRs {
+			route := &netlink.Route{
+				LinkIndex: gwConfig.LinkIndex,
+				Scope:     netlink.SCOPE_LINK,
+				Dst:       podCIDR,
+				Table:     c.serviceRtTable.Idx,
+			}
+			if err := netlink.RouteReplace(route); err != nil {
+				return fmt.Errorf("failed to add link route to service table: %v", err)
+			}
 		}
 	}
 
